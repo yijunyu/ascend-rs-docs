@@ -76,6 +76,12 @@ jobs:
           ref: ${{ env.SOURCE_REF }}
           token: ${{ secrets.PRIVATE_SOURCE_TOKEN }}
           persist-credentials: false
+          # source has a malformed gitlink (benchmarks/Ascend-910B, no .gitmodules URL)
+          # that breaks full checkout; mdbook needs only blog/mdbook + scripts.
+          submodules: false
+          sparse-checkout: |
+            blog
+            scripts
 
       - name: Install mdbook ${{ env.MDBOOK_VERSION }}
         run: |
