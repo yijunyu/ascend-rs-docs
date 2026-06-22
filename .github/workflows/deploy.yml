@@ -1,0 +1,190 @@
+name: Deploy docs (bilingual mdbook)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Builds the BILINGUAL tile-rs / ascend-rs mdbook (English + 中文) from the
+# PRIVATE source repo yijunyu/ascend-rs-priv and publishes it to THIS public
+# repo's GitHub Pages.
+#
+# WHY THIS LIVES HERE (cargo-slicer pattern):
+#   The private repo's own GitHub Actions are blocked by a failed-payment /
+#   billing gate, so its blog/mdbook/.github/workflows/mdbook.yml can no longer
+#   deploy. This PUBLIC repo runs on free, billing-immune Actions minutes; it
+#   checks out the private source read-only, builds the book, and deploys its
+#   own Pages — same shape as the existing codegen-release CI that builds from
+#   the private source and publishes to the public tile-rs repo.
+#
+# ── REQUIRED SECRET ──────────────────────────────────────────────────────────
+#   Name : PRIVATE_SOURCE_TOKEN
+#   Scope: a fine-grained PAT with Contents: Read on yijunyu/ascend-rs-priv
+#          (the SAME token already configured for yijunyu/tile-rs works).
+#   Add  : gh secret set PRIVATE_SOURCE_TOKEN --repo yijunyu/ascend-rs-docs
+#   The build job fails fast with a clear message if this secret is absent.
+#
+# ── CUSTOM DOMAIN (ascend-rs.org) ────────────────────────────────────────────
+#   This workflow deliberately does NOT write a CNAME. It deploys to the default
+#   URL https://yijunyu.github.io/ascend-rs-docs/ so the LIVE ascend-rs.org
+#   (still served by ascend-rs-priv Pages) is not disturbed. Cutover is a manual,
+#   reversible maintainer step — see the repo README / handoff notes.
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_dispatch: {}
+  # Lets the private repo (or any authorized caller) trigger a rebuild via
+  #   POST /repos/yijunyu/ascend-rs-docs/dispatches  {"event_type":"rebuild-docs"}
+  repository_dispatch:
+    types: [rebuild-docs]
+  # Daily safety refresh so the public site tracks the private source even if no
+  # explicit trigger fires (06:17 UTC, off-peak).
+  schedule:
+    - cron: '17 6 * * *'
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One in-flight Pages deploy at a time; don't cancel a running publish.
+concurrency:
+  group: docs-pages
+  cancel-in-progress: false
+
+env:
+  MDBOOK_VERSION: '0.5.2'
+  SOURCE_REPO: yijunyu/ascend-rs-priv
+  SOURCE_REF: main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail fast if PRIVATE_SOURCE_TOKEN is missing
+        env:
+          PRIVATE_SOURCE_TOKEN: ${{ secrets.PRIVATE_SOURCE_TOKEN }}
+        run: |
+          if [ -z "$PRIVATE_SOURCE_TOKEN" ]; then
+            echo "::error::Secret PRIVATE_SOURCE_TOKEN is not set on this repo."
+            echo "::error::Add a fine-grained PAT with Contents: Read on ${SOURCE_REPO}:"
+            echo "::error::  gh secret set PRIVATE_SOURCE_TOKEN --repo yijunyu/ascend-rs-docs"
+            echo "::error::(The same token configured for yijunyu/tile-rs works.)"
+            exit 1
+          fi
+
+      - name: Checkout PRIVATE source (read-only)
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.PRIVATE_SOURCE_TOKEN }}
+          persist-credentials: false
+
+      - name: Install mdbook ${{ env.MDBOOK_VERSION }}
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          url="https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          curl -sSL "$url" | tar -xz -C "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # The mdbook uses VENDORED mermaid (blog/mdbook/mermaid.min.js +
+      # mermaid-init.js wired via [output.html].additional-js), NOT the
+      # mdbook-mermaid preprocessor — so no extra binary is required.
+
+      - name: Build kernels.db (non-fatal — preprocessor degrades gracefully)
+        run: |
+          bash scripts/build_kernel_db.sh blog/mdbook/kernels.db \
+            || echo "::warning::kernels.db build failed; {{db:..}} placeholders left unsubstituted"
+
+      - name: Regenerate appendices + split chapters (non-fatal)
+        # Refreshes the committed src/ + src-zh/ from the live codebase exactly
+        # like scripts/build_mdbook.sh does. If any helper fails in CI we fall
+        # back to the chapters already committed in src/ and src-zh/.
+        run: |
+          set +e
+          bash scripts/generate_kernel_appendix.sh            > blog/appendix_kernel_inventory.md    2>/dev/null
+          bash scripts/generate_kernel_appendix.sh --lang zh  > blog/appendix_kernel_inventory_zh.md 2>/dev/null
+          bash scripts/generate_cann_appendix.sh              > blog/cann_appendix.md                 2>/dev/null
+          bash scripts/generate_cann_appendix.sh --lang zh    > blog/cann_appendix_zh.md              2>/dev/null
+          bash scripts/split_blog_to_mdbook.sh                2>/dev/null
+          bash scripts/split_blog_to_mdbook.sh --lang zh      2>/dev/null
+          echo "appendix/split step finished (rc ignored; committed src/ is the fallback)"
+
+      - name: Build English book (src -> book)
+        working-directory: blog/mdbook
+        run: mdbook build
+
+      - name: Build Chinese book (src-zh -> book-zh)
+        working-directory: blog/mdbook
+        run: |
+          cp book.toml book-en.toml.bak
+          cp book-zh.toml book.toml
+          mdbook build
+          mv book-en.toml.bak book.toml
+
+      - name: Assemble combined bilingual site (en/ + zh/ + root index)
+        run: |
+          set -euo pipefail
+          SITE="$RUNNER_TEMP/site"
+          rm -rf "$SITE"
+          mkdir -p "$SITE/en" "$SITE/zh"
+          cp -r blog/mdbook/book/.    "$SITE/en/"
+          cp -r blog/mdbook/book-zh/. "$SITE/zh/"
+
+          # Root landing page linking en/ and zh/ — mirrors the index.html that
+          # scripts/build_mdbook.sh emits for the live site. Body lines are flush
+          # at this run-block's base column so YAML strips the indent and the
+          # emitted HTML (and the closing delimiter) are clean.
+          cat > "$SITE/index.html" <<'ROOTHTML'
+          <!DOCTYPE html>
+          <html>
+          <head>
+          <meta charset="utf-8">
+          <title>tile-rs — Memory-Safe NPU Kernel Programming</title>
+          <style>
+          body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+          display: flex; justify-content: center; align-items: center; min-height: 100vh;
+          margin: 0; background: #f5f5f5; }
+          .container { text-align: center; background: white; padding: 60px 80px;
+          border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,0.1); }
+          h1 { font-size: 2em; margin-bottom: 0.3em; color: #333; }
+          .subtitle { color: #666; margin-bottom: 2em; font-size: 1.1em; }
+          .langs { display: flex; gap: 24px; justify-content: center; }
+          .lang-card { display: block; padding: 24px 48px; border: 2px solid #e0e0e0;
+          border-radius: 8px; text-decoration: none; color: #333;
+          transition: all 0.2s; font-size: 1.2em; }
+          .lang-card:hover { border-color: #4a90d9; background: #f0f6ff; transform: translateY(-2px); }
+          .lang-label { font-size: 0.8em; color: #999; display: block; margin-top: 4px; }
+          </style>
+          </head>
+          <body>
+          <div class="container">
+          <h1>tile-rs</h1>
+          <div class="subtitle">Memory-Safe NPU Kernel Programming in Rust</div>
+          <div class="langs">
+          <a href="en/index.html" class="lang-card">English<span class="lang-label">Documentation</span></a>
+          <a href="zh/index.html" class="lang-card">中文<span class="lang-label">技术文档</span></a>
+          </div>
+          </div>
+          </body>
+          </html>
+          ROOTHTML
+
+          # NOTE: deliberately NO CNAME file — keep the live ascend-rs.org on the
+          # private repo's Pages until the maintainer does the manual cutover.
+
+          echo "EN pages: $(find "$SITE/en" -name '*.html' | wc -l)"
+          echo "ZH pages: $(find "$SITE/zh" -name '*.html' | wc -l)"
+          echo "SITE_DIR=$SITE" >> "$GITHUB_ENV"
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ env.SITE_DIR }}
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4
