@@ -103,19 +103,11 @@ jobs:
           bash scripts/build_kernel_db.sh blog/mdbook/kernels.db \
             || echo "::warning::kernels.db build failed; {{db:..}} placeholders left unsubstituted"
 
-      - name: Regenerate appendices + split chapters (non-fatal)
-        # Refreshes the committed src/ + src-zh/ from the live codebase exactly
-        # like scripts/build_mdbook.sh does. If any helper fails in CI we fall
-        # back to the chapters already committed in src/ and src-zh/.
-        run: |
-          set +e
-          bash scripts/generate_kernel_appendix.sh            > blog/appendix_kernel_inventory.md    2>/dev/null
-          bash scripts/generate_kernel_appendix.sh --lang zh  > blog/appendix_kernel_inventory_zh.md 2>/dev/null
-          bash scripts/generate_cann_appendix.sh              > blog/cann_appendix.md                 2>/dev/null
-          bash scripts/generate_cann_appendix.sh --lang zh    > blog/cann_appendix_zh.md              2>/dev/null
-          bash scripts/split_blog_to_mdbook.sh                2>/dev/null
-          bash scripts/split_blog_to_mdbook.sh --lang zh      2>/dev/null
-          echo "appendix/split step finished (rc ignored; committed src/ is the fallback)"
+      # NOTE: we deliberately do NOT run scripts/split_blog_to_mdbook.sh here.
+      # That step regenerates blog/mdbook/src/ + src-zh/ from the upstream
+      # blog/*.md and would CLOBBER the committed, hand-edited chapters (the
+      # ascend->tile rebrand + the 8-backend On-HW updates). The committed
+      # blog/mdbook/src/ and src-zh/ ARE the source of truth — build them directly.
 
       - name: Build English book (src -> book)
         working-directory: blog/mdbook
