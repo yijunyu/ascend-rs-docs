@@ -69,19 +69,23 @@ jobs:
             exit 1
           fi
 
-      - name: Checkout PRIVATE source (read-only)
-        uses: actions/checkout@v5
-        with:
-          repository: ${{ env.SOURCE_REPO }}
-          ref: ${{ env.SOURCE_REF }}
-          token: ${{ secrets.PRIVATE_SOURCE_TOKEN }}
-          persist-credentials: false
-          # source has a malformed gitlink (benchmarks/Ascend-910B, no .gitmodules URL)
-          # that breaks full checkout; mdbook needs only blog/mdbook + scripts.
-          submodules: false
-          sparse-checkout: |
-            blog
-            scripts
+      - name: Checkout PRIVATE source (read-only, no submodules)
+        env:
+          PRIVATE_SOURCE_TOKEN: ${{ secrets.PRIVATE_SOURCE_TOKEN }}
+        run: |
+          set -euo pipefail
+          # actions/checkout runs submodule logic for cross-repo checkouts and chokes
+          # on the source's orphaned gitlink (benchmarks/Ascend-910B has a 160000 tree
+          # entry but no .gitmodules URL). A plain clone with --no-recurse-submodules
+          # never inits submodules, so the gitlink is just left as an empty dir.
+          git clone --depth 1 --no-tags --no-recurse-submodules -c submodule.recurse=false \
+            --branch "${SOURCE_REF}" \
+            "https://x-access-token:${PRIVATE_SOURCE_TOKEN}@github.com/${SOURCE_REPO}.git" . \
+          || git clone --depth 1 --no-tags --no-recurse-submodules -c submodule.recurse=false \
+            "https://x-access-token:${PRIVATE_SOURCE_TOKEN}@github.com/${SOURCE_REPO}.git" .
+          # drop the tokenized remote so it never lingers
+          git remote remove origin 2>/dev/null || true
+          git log --oneline -1 || true
 
       - name: Install mdbook ${{ env.MDBOOK_VERSION }}
         run: |
